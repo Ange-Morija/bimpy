@@ -1,86 +1,109 @@
-# extract_zone_fixed.py
-import logging
+# functions/extract_zone_fixed.py
+import sys
 from pathlib import Path
 import ifcopenshell
-import ifcpatch
-import sys
+import ifcopenshell.util.element as element_util
+import shutil
+import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-def find_space_or_building(model, query: str):
-    q = (query or "").lower()
-    # search IfcSpace by LongName / Name
-    for s in model.by_type("IfcSpace"):
-        longname = getattr(s, "LongName", None) or ""
-        name = getattr(s, "Name", None) or ""
-        if q in longname.lower() or q in name.lower():
-            return ("IfcSpace", s)
-    # fallback: IfcBuilding
-    for b in model.by_type("IfcBuilding"):
-        name = getattr(b, "Name", "") or ""
-        if q in name.lower():
-            return ("IfcBuilding", b)
-    return (None, None)
+def find_space(model, query):
+    q = query.lower()
+    for s in model.by_type('IfcSpace'):
+        name = (getattr(s, 'Name', '') or '').lower()
+        longname = (getattr(s, 'LongName', '') or '').lower()
+        if q in name or q in longname:
+            return s
+    # fallback: search IfcBuilding name
+    for b in model.by_type('IfcBuilding'):
+        if q in (getattr(b, 'Name', '') or '').lower():
+            return b
+    return None
 
-def extract_zone_to_file(ifc_in: Path, query: str, out_file: Path, log_file: Path | None = None):
-    logging.info("Opening IFC: %s", ifc_in)
-    model = ifcopenshell.open(str(ifc_in))
-
-    kind, target = find_space_or_building(model, query)
-    if target is None:
-        raise RuntimeError(f"No IfcSpace or IfcBuilding matching '{query}' found.")
-
-    gid = getattr(target, "GlobalId", None)
-    logging.info("Found target: type=%s, GlobalId=%s, Name=%s, LongName=%s",
-                 kind, gid, getattr(target, "Name", ""), getattr(target, "LongName", ""))
-
-    # build selector string for ifcpatch
-    selector = f"{kind}[GlobalId='{gid}']"
-    logging.info("Using selector for extraction: %s", selector)
-
-    params = {
-        "input": str(ifc_in),
-        "file": model,                      # <--- important: pass the opened model object
-        "recipe": "ExtractElements",
-        "arguments": [selector],
-        "log": str(log_file) if log_file else None,
-        "output": str(out_file)              # optional, but we still call ifcpatch.write below
-    }
-
-    logging.info("Executing ifcpatch ExtractElements recipe (this preserves geometry and related items)...")
+def create_new_file_like(src_model):
+    # create new file with same schema version
     try:
-        output = ifcpatch.execute(params)
-        # write the output to disk
-        ifcpatch.write(output, str(out_file))
-        logging.info("Extraction written to: %s", out_file)
-    except Exception as e:
-        logging.exception("Extraction échouée:")
-        raise
+        new = ifcopenshell.file(schema_version=src_model.schema)
+    except Exception:
+        # fallback: use schema_version attribute
+        new = ifcopenshell.file(schema_version=src_model.schema_version)
+    return new
 
-    # quick validation: reopen written file and check IfcShapeRepresentation counts
-    out_model = ifcopenshell.open(str(out_file))
-    shape_count = len(out_model.by_type("IfcShapeRepresentation"))
-    logging.info("Post-check: IfcShapeRepresentation count in output: %d", shape_count)
-    if shape_count == 0:
-        logging.warning("Aucune IfcShapeRepresentation trouvée dans l'export -> Autodesk Viewer pourra indiquer 'modèle vide'.")
+def minimal_spatial_setup(new_model, source_space):
+    # create minimal spatial elements (IfcProject/IfcSite/IfcBuilding/IfcBuildingStorey/IfcSpace copy)
+    # we will copy the space entity itself using copy_deep so relationships stay consistent.
+    # create project, site, building, storey in the new file
+    project = new_model.create_entity('IfcProject', GlobalId=ifcopenshell.guid.new(), Name='Extracted project')
+    site = new_model.create_entity('IfcSite', GlobalId=ifcopenshell.guid.new(), Name='Extracted site')
+    building = new_model.create_entity('IfcBuilding', GlobalId=ifcopenshell.guid.new(), Name='Extracted building')
+    storey = new_model.create_entity('IfcBuildingStorey', GlobalId=ifcopenshell.guid.new(), Name='Extracted storey')
+    # set up aggregation relationships
+    new_model.create_entity('IfcRelAggregates', GlobalId=ifcopenshell.guid.new(), RelatingObject=project, RelatedObjects=[site])
+    new_model.create_entity('IfcRelAggregates', GlobalId=ifcopenshell.guid.new(), RelatingObject=site, RelatedObjects=[building])
+    new_model.create_entity('IfcRelAggregates', GlobalId=ifcopenshell.guid.new(), RelatingObject=building, RelatedObjects=[storey])
+    # copy the space (deep copy) and attach to storey using IfcRelContainedInSpatialStructure
+    copied_space = element_util.copy_deep(new_model, source_space)
+    new_model.create_entity('IfcRelContainedInSpatialStructure', GlobalId=ifcopenshell.guid.new(), RelatingStructure=storey, RelatedElements=[copied_space])
+    return project, site, building, storey, copied_space
 
-    return out_file
+def collect_products_for_space(space):
+    products = set()
+    # search inverses of space
+    for inv in space.get_inverse():
+        # many inverse types; check related elements attributes
+        for attr in dir(inv):
+            try:
+                val = getattr(inv, attr)
+                if isinstance(val, list):
+                    for v in val:
+                        if hasattr(v, 'is_a') and v.is_a() and v.is_a().startswith('Ifc') and v.is_a() != 'IfcSpace':
+                            products.add(v)
+                else:
+                    if hasattr(val, 'is_a') and val.is_a() and val.is_a().startswith('Ifc') and val.is_a() != 'IfcSpace':
+                        products.add(val)
+            except Exception:
+                continue
+    # fallback: if no inverses found, search for IfcRelContainedInSpatialStructure referencing this space by globalid
+    # but above loop usually finds them.
+    return list(products)
+
+def extract_zone_copy_deep(ifc_in: Path, query: str, ifc_out: Path):
+    src = ifcopenshell.open(str(ifc_in))
+    target = find_space(src, query)
+    if not target:
+        raise RuntimeError(f"Target not found for query: {query}")
+    logging.info(f"Found target: type={target.is_a()}, GlobalId={target.GlobalId}, Name={getattr(target,'Name',None)}, LongName={getattr(target,'LongName',None)}")
+
+    products = collect_products_for_space(target)
+    logging.info(f"Found {len(products)} products assigned to the space (via inverses).")
+
+    new = create_new_file_like(src)
+    # minimal header + spatial structure and copy space
+    project, site, building, storey, copied_space = minimal_spatial_setup(new, target)
+    # copy each product deep into new model and attach to copied_space or storey (depending original)
+    for i, p in enumerate(products, start=1):
+        logging.info(f"Copying product {i}/{len(products)}: {p.is_a()} {getattr(p,'GlobalId',None)}")
+        try:
+            cp = element_util.copy_deep(new, p)
+            # attach product to storey (or to the space)
+            try:
+                new.create_entity('IfcRelContainedInSpatialStructure', GlobalId=ifcopenshell.guid.new(), RelatingStructure=storey, RelatedElements=[cp])
+            except Exception:
+                pass
+        except Exception as e:
+            logging.warning("copy_deep failed for product: %s - %s", getattr(p,'GlobalId',None), e)
+
+    # write
+    ifc_out.parent.mkdir(parents=True, exist_ok=True)
+    new.write(str(ifc_out))
+    logging.info("Wrote extracted file to %s", str(ifc_out))
 
 def main():
-    import argparse
-    p = argparse.ArgumentParser(description="Extract zone/building to a new IFC using ifcpatch ExtractElements (fixed).")
-    p.add_argument("-i", "--ifc", required=True, help="Input IFC file (path)")
-    p.add_argument("-q", "--query", required=True, help="Recherche (ex: 'ZONA DE EMBARQUE')")
-    p.add_argument("-o", "--out", required=True, help="IFC de sortie")
-    p.add_argument("-l", "--log", help="log file (optionnel)")
-    args = p.parse_args()
-
-    try:
-        extract_zone_to_file(Path(args.ifc), args.query, Path(args.out), Path(args.log) if args.log else None)
-        logging.info("Extraction terminée.")
-    except Exception as e:
-        logging.error("Erreur: %s", e)
+    if len(sys.argv) < 4:
+        print("Usage: python extract_zone_fixed.py input.ifc \"QUERY\" output.ifc")
         sys.exit(1)
+    extract_zone_copy_deep(Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]))
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
