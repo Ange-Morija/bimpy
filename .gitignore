@@ -1,0 +1,9 @@
+# Ignore Python virtual environment
+env310/
+env310/*
+
+# Ignore all files in input and output directories
+input/
+input/*
+output/
+output/*
