@@ -1,151 +1,97 @@
-# functions/extract_zone_with_geom.py
-import logging
+"""Extract a spatial zone (IfcSpace) and its related products into a new IFC file.
+
+This version is a compact, well-documented implementation that tries to copy
+only the necessary geometry contexts, the space, and products contained in it.
+"""
 from pathlib import Path
-import argparse
-import ifcopenshell
-from tqdm import tqdm
-import sys
-
-LOG_PATH = Path("output") / "extract_zone.log"
-LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    filename=str(LOG_PATH),
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
-console = logging.StreamHandler(sys.stdout)
-console.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-console.setFormatter(formatter)
-logging.getLogger().addHandler(console)
-
-
-def open_model(ifc_path: Path):
-    logging.info(f"Opening IFC: {ifc_path}")
-    if not ifc_path.exists():
-        raise FileNotFoundError(ifc_path)
-    return ifcopenshell.open(str(ifc_path))
+from typing import List
+try:
+    import ifcopenshell
+    import ifcopenshell.util.element as element_util
+    import ifcopenshell.guid
+except Exception:  # pragma: no cover - dependency
+    ifcopenshell = None
 
 
 def find_space(model, query: str):
-    q = query.lower()
-    logging.info(f"Searching IfcSpace for query: {query}")
-    for s in model.by_type("IfcSpace"):
-        name = (s.LongName or s.Name or "").lower()
+    q = query.lower().strip()
+    for s in model.by_type('IfcSpace'):
+        name = (getattr(s, 'LongName', None) or getattr(s, 'Name', None) or '').lower()
         if q in name:
-            logging.info(f"Found IfcSpace: GlobalId={s.GlobalId} Name={s.Name} LongName={s.LongName}")
             return s
+    # fallback: building/storey
+    for t in ('IfcBuildingStorey', 'IfcBuilding'):
+        for e in model.by_type(t):
+            if getattr(e, 'Name', None) and q in str(e.Name).lower():
+                return e
     return None
 
 
-def collect_products_in_space(model, space):
-    # collect products belonging to space by inverse IfcRelContainedInSpatialStructure
-    products = set()
+def collect_products_in_space(model, space) -> List:
+    prods = set()
     for inv in model.get_inverse(space):
-        if inv.is_a("IfcRelContainedInSpatialStructure"):
-            for p in getattr(inv, "RelatedElements", []) or []:
-                products.add(p)
-    logging.info(f"Found {len(products)} products in the space")
-    return list(products)
+        if inv.is_a('IfcRelContainedInSpatialStructure'):
+            for p in getattr(inv, 'RelatedElements', []) or []:
+                prods.add(p)
+    return list(prods)
 
 
-def ensure_contexts_copied(orig, new):
-    # copy geometric contexts and representation maps first
-    for ctx in orig.by_type("IfcGeometricRepresentationContext"):
-        new.add(ctx)
-    for rmap in orig.by_type("IfcRepresentationMap"):
-        new.add(rmap)
+def extract_zone_to_file(ifc_input: Path, query: str, out_ifc: Path) -> Path:
+    if ifcopenshell is None:
+        raise RuntimeError('ifcopenshell required')
+    src = ifcopenshell.open(str(ifc_input))
+    target = find_space(src, query)
+    if not target:
+        raise RuntimeError('Zone not found')
+    products = collect_products_in_space(src, target)
 
+    new = ifcopenshell.file(schema=src.schema)
+    # copy minimal header/project
+    projects = src.by_type('IfcProject')
+    if projects:
+        new.add(projects[0])
+    # copy geometric contexts and maps
+    for c in src.by_type('IfcGeometricRepresentationContext'):
+        new.add(c)
+    for m in src.by_type('IfcRepresentationMap'):
+        new.add(m)
 
-def add_product_and_geometry(orig, new, product):
-    """
-    Add product + its direct representation items and inverses.
-    We explicitly add:
-      - product (new.add(product))
-      - product.Representation -> each IfcShapeRepresentation -> add and add Items
-      - inverse relationships (e.g. relationships that reference the product)
-    """
-    # add product (this will attempt to copy related entities recursively)
-    new.add(product)
-
-    # explicit: ensure product's representation items are present
-    prod_rep = getattr(product, "Representation", None)
-    if prod_rep:
-        reps = getattr(prod_rep, "Representations", []) or []
-        for rep in reps:
-            new.add(rep)
-            items = getattr(rep, "Items", []) or []
-            for it in items:
-                new.add(it)
-
-    # copy inverse relationships (helpful to keep relations like IfcRelAggregates/Associates)
-    for inv in orig.get_inverse(product):
+    # add the spatial container and related inverses
+    new.add(target)
+    for inv in src.get_inverse(target):
         new.add(inv)
 
-
-def extract_zone_to_file(ifc_input: Path, query: str, out_ifc: Path):
-    model = open_model(ifc_input)
-    space = find_space(model, query)
-    if not space:
-        logging.error("No IfcSpace found for query")
-        raise SystemExit(1)
-
-    products = collect_products_in_space(model, space)
-    if len(products) == 0:
-        logging.warning("No products in zone; file may appear empty in viewer.")
-
-    # create new target file with same schema
-    new_model = ifcopenshell.file(schema=model.schema)
-    # copy header basics
-    try:
-        new_model.assign_header_from(model)
-    except Exception:
-        logging.debug("assign_header_from failed or not available; continuing")
-
-    # copy project (header) minimal
-    project = model.by_type("IfcProject")
-    if project:
-        new_model.add(project[0])
-
-    # copy geometic contexts & maps first (important)
-    ensure_contexts_copied(model, new_model)
-
-    # add the space itself (so spatial container exists)
-    new_model.add(space)
-
-    # progress bar for products
-    logging.info("Collecte des produits assignés à la zone (analyse des relations inverses)...")
-    for p in tqdm(products, desc="Copying products", unit="prod"):
+    for p in products:
         try:
-            add_product_and_geometry(model, new_model, p)
-        except Exception as e:
-            logging.exception(f"Failed to copy product {getattr(p,'GlobalId',str(p))}: {e}")
-
-    # also copy any spatial containment inverses (storey, building) so tree exists
-    for inv in model.get_inverse(space):
-        new_model.add(inv)  # e.g. IfcRelContainedInSpatialStructure
+            new.add(p)
+            # ensure representation items are present
+            rep = getattr(p, 'Representation', None)
+            if rep:
+                for r in getattr(rep, 'Representations', []) or []:
+                    new.add(r)
+                    for it in getattr(r, 'Items', []) or []:
+                        new.add(it)
+            for inv in src.get_inverse(p):
+                new.add(inv)
+        except Exception:
+            # best-effort copy
+            continue
 
     out_ifc.parent.mkdir(parents=True, exist_ok=True)
-    logging.info(f"Writing extracted IFC to: {out_ifc}")
-    new_model.write(str(out_ifc))
-    logging.info("Done.")
+    new.write(str(out_ifc))
     return out_ifc
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ifc", default="input/merged.ifc", help="Input merged IFC")
-    parser.add_argument("--query", required=True, help="Zone query (partial LongName/Name)")
-    parser.add_argument("--out", default="output/zone_extract.ifc", help="Output small IFC path")
-    args = parser.parse_args()
-
-    try:
-        outp = extract_zone_to_file(Path(args.ifc), args.query, Path(args.out))
-        logging.info(f"Extraction done -> {outp}")
-    except Exception as e:
-        logging.exception("Extraction échouée:")
-        raise
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--ifc', default='input/merged.ifc')
+    ap.add_argument('--query', required=True)
+    ap.add_argument('--out', default='output/zone_extract.ifc')
+    args = ap.parse_args()
+    p = extract_zone_to_file(Path(args.ifc), args.query, Path(args.out))
+    print('Wrote', p)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

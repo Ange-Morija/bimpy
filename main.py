@@ -1,5 +1,5 @@
 # appeler depuis la racine du projet
-from functions.merge_ifc import merge_ifcs, gather_input_files, setup_logger
+from bimpy.functions.merge_ifc import merge_ifcs, gather_input_files, setup_logger
 
 # préparer fichiers
 files = gather_input_files(inputs=None, input_dir="input", recursive=True)

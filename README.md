@@ -22,22 +22,22 @@ pip install ifcopenshell
 
 ## Usage
 
-### Detect Duplicates
+### CLI
+
+Un nouveau point d'entrée `cli.py` expose l'ensemble des fonctionnalités via des sous-commandes.
+
+Exemples rapides (depuis la racine du projet):
 
 ```bash
-python merge_ifc.py detect --input-dir input --recursive --report duplicates.json --csv duplicates.csv
-```
-
-### Merge IFC Files
-
-```bash
-python merge_ifc.py merge --input-dir input -o output/merged.ifc --remap --recursive
-```
-
-To force a specific base file:
-
-```bash
-python merge_ifc.py merge --input-dir input --base input/my_base.ifc -o output/merged.ifc --remap --recursive
+python cli.py merge --input-dir input -o output/merged.ifc --remap --recursive
+python cli.py detect --input-dir input --recursive --report output/duplicates.json --csv output/duplicates.csv
+python cli.py check --ifc output/merged.ifc --report output/check_report.json
+python cli.py check-all
+python cli.py extract --ifc input/merged.ifc --query "Ma zone" --out output/zone.ifc
+python cli.py recenter --input output/merged.ifc --output output/merged_recentred.ifc
+python cli.py add-sensors sensors.json input/merged.ifc output/with_sensors.ifc
+python cli.py diagnose input/merged.ifc output/diagnose.json
+python cli.py find-zone --ifc input/merged.ifc --query "zone_name"
 ```
 
 ### Options

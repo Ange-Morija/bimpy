@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bimpy"
+version = "0.0.0"
+description = "Small toolkit for IFC merging and inspection"
+authors = [ {name = "Ange-Morija"} ]
+readme = "README.md"
+dependencies = [
+    "ifcopenshell",
+    "tqdm",
+]
