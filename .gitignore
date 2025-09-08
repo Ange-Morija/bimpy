@@ -1,0 +1,6 @@
+env312/
+__pycache__/
+*.pyc
+outputs/*
+inputs/*
+!.gitkeep

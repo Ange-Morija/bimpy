@@ -1,0 +1,15 @@
+colorama==0.4.6
+ifcopenshell==0.8.3.post2
+ifcpatch==0.8.3
+isodate==0.7.2
+lark==1.2.2
+numpy==2.3.2
+pandas==2.3.2
+python-dateutil==2.9.0.post0
+pytz==2025.2
+shapely==2.1.1
+six==1.17.0
+toposort==1.10
+tqdm==4.67.1
+typing_extensions==4.15.0
+tzdata==2025.2
